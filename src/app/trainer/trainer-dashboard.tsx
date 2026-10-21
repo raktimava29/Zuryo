@@ -2,7 +2,7 @@
 
 import LogoutButton from "@/app/components/logout-button";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type SessionStatus = "CONFIRMED" | "IN_PROGRESS" | "COMPLETED";
 type TrainerSession = {
@@ -51,7 +51,8 @@ function formatCountdown(seconds: number | null) {
 
 export default function TrainerDashboard({ trainerName }: { trainerName: string }) {
   const [sessions, setSessions] = useState<TrainerSession[]>([]);
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(0);
+  const warnedSessionIds = useRef(new Set<string>());
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -66,16 +67,18 @@ export default function TrainerDashboard({ trainerName }: { trainerName: string 
 
   useEffect(() => {
     let active = true;
-    void loadSessions()
-      .catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : "Could not load sessions"); })
-      .finally(() => { if (active) setLoading(false); });
+    const initialLoad = window.setTimeout(() => {
+      void loadSessions()
+        .catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : "Could not load sessions"); })
+        .finally(() => { if (active) setLoading(false); });
+    }, 0);
     const clock = window.setInterval(() => setNow(Date.now()), 1000);
     const refresh = window.setInterval(() => {
       void loadSessions().catch((reason: unknown) => {
         if (active) setError(reason instanceof Error ? reason.message : "Refresh failed");
       });
     }, 15000);
-    return () => { active = false; window.clearInterval(clock); window.clearInterval(refresh); };
+    return () => { active = false; window.clearTimeout(initialLoad); window.clearInterval(clock); window.clearInterval(refresh); };
   }, [loadSessions]);
 
   const activeSessions = useMemo(() => sessions.filter((s) => s.status === "IN_PROGRESS"), [sessions]);
@@ -94,7 +97,8 @@ export default function TrainerDashboard({ trainerName }: { trainerName: string 
           const synced = body.session as SyncResponse;
           if (active && synced.completed_now) {
             setNotice("Session completed.");
-          } else if (active && synced.warning_created_now) {
+          } else if (active && synced.warning_due && !warnedSessionIds.current.has(id)) {
+            warnedSessionIds.current.add(id);
             setNotice("55-minute warning reached.");
           }
         } catch (reason) {

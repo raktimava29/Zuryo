@@ -2,10 +2,21 @@
 
 import LogoutButton from "@/app/components/logout-button";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+declare global {
+  interface Window {
+    Razorpay?: new (options: Record<string, unknown>) => {
+      open: () => void;
+      on: (event: string, callback: (event: { error?: { description?: string } }) => void) => void;
+    };
+  }
+}
 
 type ServiceZone = { id: string; name: string; timezone: string };
 type Trainer = { trainer_id: string; full_name: string };
+type PackageOption = { id: string; name: string; session_count: number; price_paise: number; validity_days: number };
+type CustomerPackage = { id: string; catalog_id: string | null; sessions_purchased: number; sessions_remaining: number; expires_at: string | null };
 type Booking = {
   id: string;
   starts_at: string;
@@ -32,12 +43,16 @@ export default function BookingPanel({ customerName }: { customerName: string })
   const [zoneId, setZoneId] = useState("");
   const [mode, setMode] = useState<"INSTANT" | "SCHEDULED">("INSTANT");
   const [startsAt, setStartsAt] = useState(() => localDateTimeValue(new Date(Date.now() + 15 * 60_000)));
+  const [minDateTime, setMinDateTime] = useState(() => localDateTimeValue(new Date(Date.now() + 60_000)));
   const [trainers, setTrainers] = useState<Trainer[]>([]);
   const [trainerId, setTrainerId] = useState("");
   const [booking, setBooking] = useState<Booking | null>(null);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [checkoutBusy, setCheckoutBusy] = useState(false);
+  const [catalog, setCatalog] = useState<PackageOption[]>([]);
+  const [packages, setPackages] = useState<CustomerPackage[]>([]);
+  const [selectedPackageId, setSelectedPackageId] = useState("");
 
   useEffect(() => {
     fetch("/api/service-zones")
@@ -49,6 +64,99 @@ export default function BookingPanel({ customerName }: { customerName: string })
       })
       .catch((error: Error) => setMessage(error.message));
   }, []);
+
+  const refreshPackages = useCallback(async () => {
+    const response = await fetch("/api/packages", { cache: "no-store" });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error ?? "Could not load packages.");
+    setCatalog(body.catalog ?? []); setPackages(body.packages ?? []);
+    if (body.packages?.[0]) setSelectedPackageId((current) => current || body.packages[0].id);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      refreshPackages().catch((error: Error) => {
+        if (!cancelled) setMessage(error.message);
+      });
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [refreshPackages]);
+
+  function loadRazorpay(): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (window.Razorpay) { resolve(true); return; }
+      const script = document.createElement("script"); script.src = "https://checkout.razorpay.com/v1/checkout.js";
+      script.onload = () => resolve(true); script.onerror = () => resolve(false); document.body.appendChild(script);
+    });
+  }
+
+  async function startRazorpayCheckout(bookingId: string) {
+    setCheckoutBusy(true); setMessage("");
+    try {
+      const response = await fetch("/api/payments/razorpay/order", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bookingId }) });
+      const order = await response.json(); if (!response.ok) throw new Error(order.error ?? "Could not start payment.");
+      if (!await loadRazorpay()) throw new Error("Razorpay checkout script could not load. Check network/ad blocker and retry.");
+      const options = { key: order.keyId, amount: order.amount, currency: order.currency, name: "Zuryo", description: "60-minute training session", order_id: order.orderId,
+        handler: async () => {
+          setMessage("Payment submitted. Waiting for verified payment confirmation…");
+          for (let attempt = 0; attempt < 15; attempt++) {
+            await new Promise((resolve) => window.setTimeout(resolve, 2000));
+            try {
+              const statusResponse = await fetch(`/api/payments/status?bookingId=${encodeURIComponent(bookingId)}`, { cache: "no-store" });
+              const statusBody = await statusResponse.json();
+              if (statusResponse.ok && statusBody.booking) {
+                setBooking((current) => current ? { ...current, status: statusBody.booking.status } : current);
+                if (statusBody.booking.status === "CONFIRMED") { setMessage("Payment verified. Booking confirmed."); return; }
+                if (statusBody.booking.status === "PAYMENT_FAILED") { setMessage("Payment failed. Booking hold released."); return; }
+              }
+            } catch { /* Webhook remains source of truth; retry status check. */ }
+          }
+          setMessage("Payment submitted, but confirmation is still pending. Check again shortly; do not pay again until status resolves.");
+        },
+        modal: { ondismiss: () => setMessage("Checkout closed. Booking remains pending until payment confirmation or hold expiry.") },
+        theme: { color: "#0f766e" } };
+      const Razorpay = window.Razorpay; if (!Razorpay) throw new Error("Razorpay checkout unavailable.");
+      const checkout = new Razorpay(options); checkout.on("payment.failed", (event: { error?: { description?: string } }) => setMessage(event.error?.description ?? "Payment failed. Booking remains pending until failure webhook or hold expiry.")); checkout.open();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Checkout failed."); } finally { setCheckoutBusy(false); }
+  }
+
+  async function buyPackage(catalogId: string) {
+    const priorPackageIds = new Set(packages.map((pkg) => pkg.id));
+    setCheckoutBusy(true); setMessage("");
+    try {
+      const response = await fetch("/api/packages/purchase", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ catalogId }) });
+      const order = await response.json(); if (!response.ok) throw new Error(order.error ?? "Could not start package purchase.");
+      if (!await loadRazorpay()) throw new Error("Razorpay checkout script could not load.");
+      const Razorpay = window.Razorpay; if (!Razorpay) throw new Error("Razorpay checkout unavailable.");
+      const checkout = new Razorpay({ key: order.keyId, amount: order.amount, currency: order.currency, name: "Zuryo", description: `${order.package.name} package`, order_id: order.orderId, handler: async () => {
+          setMessage("Package payment submitted. Waiting for verified payment confirmation…");
+          for (let attempt = 0; attempt < 15; attempt++) {
+            await new Promise((resolve) => window.setTimeout(resolve, 2000));
+            try {
+              await refreshPackages();
+              const balanceResponse = await fetch("/api/packages", { cache: "no-store" });
+              const balanceBody = await balanceResponse.json();
+              if (balanceResponse.ok && (balanceBody.packages ?? []).some((pkg: CustomerPackage) => pkg.catalog_id === catalogId && !priorPackageIds.has(pkg.id))) {
+                setMessage("Package payment verified. Session credits added."); return;
+              }
+            } catch { /* Retry while webhook processing completes. */ }
+          }
+          setMessage("Payment submitted, but package credits have not appeared yet. Refresh balance shortly; do not purchase again until status resolves.");
+        }, modal: { ondismiss: () => setMessage("Checkout closed. Package credits are added only after verified payment confirmation.") }, theme: { color: "#0f766e" } });
+      checkout.on("payment.failed", (event: { error?: { description?: string } }) => setMessage(event.error?.description ?? "Package payment failed.")); checkout.open();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Package purchase failed."); } finally { setCheckoutBusy(false); }
+  }
+
+  async function redeemPackage() {
+    if (!booking || !selectedPackageId) return;
+    setCheckoutBusy(true); setMessage("");
+    try { const response = await fetch("/api/packages/redeem", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bookingId: booking.id, packageId: selectedPackageId }) }); const body = await response.json(); if (!response.ok) throw new Error(body.error ?? "Could not redeem package."); setBooking({ ...booking, status: "CONFIRMED" }); setMessage("Package credit applied. Booking confirmed."); await refreshPackages(); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Package redemption failed."); } finally { setCheckoutBusy(false); }
+  }
 
   const price = useMemo(() => {
     const hour = new Date(startsAt).getHours();
@@ -91,36 +199,6 @@ export default function BookingPanel({ customerName }: { customerName: string })
     } finally { setBusy(false); }
   }
 
-  async function checkout(outcome: "SUCCESS" | "FAILURE") {
-    if (!booking) return;
-    setCheckoutBusy(true);
-    setMessage("");
-    try {
-      const response = await fetch("/api/checkout", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          bookingId: booking.id,
-          idempotencyKey: crypto.randomUUID(),
-          outcome,
-        }),
-      });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? "Checkout failed.");
-      setBooking(body.booking as Booking);
-      setMessage(body.paymentStatus === "SUCCEEDED"
-        ? "Simulated payment successful. Booking confirmed."
-        : body.paymentStatus === "FAILED"
-          ? "Simulated payment failed. Slot released."
-          : "Payment state unchanged.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Checkout failed.");
-    } finally {
-      setCheckoutBusy(false);
-    }
-  }
-
-  const minDateTime = localDateTimeValue(new Date(Date.now() + (mode === "INSTANT" ? 1 : 60) * 60_000));
 
   return (
     <main className="mx-auto w-full max-w-5xl px-5 py-10 sm:px-8">
@@ -138,7 +216,7 @@ export default function BookingPanel({ customerName }: { customerName: string })
           <p className="mt-1 text-sm text-slate-600">Availability is checked by server against trainer schedules and active bookings.</p>
           <div className="mt-6 flex gap-2 rounded-xl bg-slate-100 p-1">
             {(["INSTANT", "SCHEDULED"] as const).map((item) => <button key={item} type="button"
-              onClick={() => { setMode(item); setTrainers([]); setTrainerId(""); setBooking(null); setStartsAt(localDateTimeValue(new Date(Date.now() + (item === "INSTANT" ? 15 : 24 * 60) * 60_000))); }}
+              onClick={() => { setMode(item); setTrainers([]); setTrainerId(""); setBooking(null); setStartsAt(localDateTimeValue(new Date(Date.now() + (item === "INSTANT" ? 15 : 24 * 60) * 60_000))); setMinDateTime(localDateTimeValue(new Date(Date.now() + (item === "INSTANT" ? 1 : 60) * 60_000))); }}
               className={`flex-1 rounded-lg px-4 py-3 text-sm font-semibold transition ${mode === item ? "bg-white text-slate-950 shadow-sm" : "text-slate-600 hover:text-slate-950"}`}>
               {item === "INSTANT" ? "Instant · next hour" : "Schedule ahead"}</button>)}
           </div>
@@ -163,8 +241,9 @@ export default function BookingPanel({ customerName }: { customerName: string })
           </div>}
           {message && <p role="status" className="mt-4 rounded-xl bg-slate-100 px-4 py-3 text-sm text-slate-700">{message}</p>}
           {booking && <div className="mt-5 rounded-xl border border-teal-200 bg-teal-50 p-4"><p className="font-semibold text-teal-950">Booking reference</p><p className="mt-1 break-all text-sm text-teal-900">{booking.id}</p><p className="mt-1 text-sm text-teal-900">Status: {booking.status.replaceAll("_", " ")}</p>
-            {booking.status === "PENDING_PAYMENT" && <div className="mt-4 flex flex-wrap gap-3"><button type="button" disabled={checkoutBusy} onClick={() => checkout("SUCCESS")} className="rounded-lg bg-teal-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{checkoutBusy ? "Processing…" : `Simulate payment · ${money(booking.total_paise)}`}</button><button type="button" disabled={checkoutBusy} onClick={() => checkout("FAILURE")} className="rounded-lg border border-rose-300 px-4 py-2 text-sm font-semibold text-rose-800 disabled:opacity-50">Simulate failure</button></div>}
+            {booking.status === "PENDING_PAYMENT" && <div className="mt-4 space-y-3"><button type="button" disabled={checkoutBusy} onClick={() => startRazorpayCheckout(booking.id)} className="rounded-lg bg-teal-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{checkoutBusy ? "Opening checkout…" : `Pay with Razorpay · ${money(booking.total_paise)}`}</button>{packages.length > 0 && <div className="rounded-lg border border-teal-200 bg-white p-3"><label className="block text-sm font-medium text-slate-800">Or use package credit<select value={selectedPackageId} onChange={(e) => setSelectedPackageId(e.target.value)} className="mt-2 w-full rounded-lg border border-slate-300 p-2">{packages.map((pkg) => <option key={pkg.id} value={pkg.id}>{pkg.sessions_remaining} sessions remaining{pkg.expires_at ? ` · expires ${new Date(pkg.expires_at).toLocaleDateString()}` : ""}</option>)}</select></label><button type="button" disabled={checkoutBusy || !selectedPackageId} onClick={redeemPackage} className="mt-3 rounded-lg border border-teal-700 px-4 py-2 text-sm font-semibold text-teal-800 disabled:opacity-50">Confirm using 1 session credit</button></div>}</div>}
           </div>}
+          <div className="mt-6 border-t border-slate-200 pt-5"><div className="flex items-center justify-between gap-3"><h2 className="text-xl font-semibold text-slate-950">Session packages</h2><button type="button" onClick={() => refreshPackages().catch((error: Error) => setMessage(error.message))} className="text-sm font-semibold text-teal-700">Refresh balances</button></div><p className="mt-1 text-sm text-slate-600">Credits appear only after Razorpay webhook confirms payment.</p>{packages.length > 0 && <p className="mt-3 text-sm font-medium text-slate-800">Your credits: {packages.reduce((sum, item) => sum + item.sessions_remaining, 0)} session(s)</p>}<div className="mt-3 grid gap-3 sm:grid-cols-2">{catalog.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 p-4"><p className="font-semibold text-slate-950">{item.name}</p><p className="mt-1 text-sm text-slate-600">{item.session_count} sessions · valid {item.validity_days} days</p><p className="mt-2 text-lg font-bold text-slate-950">{money(item.price_paise)}</p><button type="button" disabled={checkoutBusy} onClick={() => buyPackage(item.id)} className="mt-3 w-full rounded-lg bg-slate-950 px-3 py-2 text-sm font-semibold text-white disabled:opacity-50">Buy package</button></div>)}</div>{catalog.length === 0 && <p className="mt-3 text-sm text-slate-500">No active packages. Add catalog entries in Supabase after applying migrations.</p>}</div>
         </section>
 
         <aside className="h-fit rounded-2xl bg-slate-950 p-6 text-white shadow-sm">

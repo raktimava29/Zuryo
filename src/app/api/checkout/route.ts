@@ -9,6 +9,9 @@ const checkoutSchema = z.object({
 });
 
 export async function POST(request: Request) {
+  if (process.env.NODE_ENV === "production" || process.env.ENABLE_SIMULATED_CHECKOUT !== "true") {
+    return NextResponse.json({ error: "Simulated checkout is disabled. Use Razorpay checkout." }, { status: 410 });
+  }
   const supabase = await createClient();
   const { data: { user }, error: authError } = await supabase.auth.getUser();
   if (authError || !user) {
