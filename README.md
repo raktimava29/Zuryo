@@ -1,36 +1,64 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Zuryo
 
-## Getting Started
+On-demand fitness booking MVP built with Next.js, TypeScript, Supabase Auth/Postgres, and SQL RPCs.
 
-First, run the development server:
+## Current booking flow
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+- Customer signs in and opens `/customer`.
+- Selects service zone, instant booking (next 60 minutes) or scheduled booking (at least 60 minutes ahead), and start time.
+- Availability API calls a role-checked database function. Database filters trainers by zone, active availability, and overlapping bookings.
+- Customer selects an available trainer and submits booking request.
+- `create_booking` calculates price and commission on the server, creates a `PENDING_PAYMENT` booking, session record, and trainer notification.
+- `/api/checkout` runs simulated success/failure against the server-stored booking total. It never accepts a client-supplied amount.
+- Unpaid holds expire after 10 minutes when booking/availability/checkout APIs run. Expired bookings become `PAYMENT_FAILED`, releasing trainer slot.
+- Price shown in UI is an estimate. Stored database amount is authoritative.
+
+Peak pricing currently assumes service-zone local time windows 06:00–09:00 and 17:00–21:00. Confirm this assumption with product owner before production.
+
+## Environment
+
+Create `.env.local` with:
+
+```env
+NEXT_PUBLIC_SUPABASE_URL=your_supabase_project_url
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your_supabase_publishable_key
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Never expose Supabase service-role keys in browser code.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Database setup
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Apply migrations in order in Supabase SQL Editor:
 
-## Learn More
+1. `supabase/migrations/initial_schema.sql`
+2. `supabase/migrations/booking_engine.sql`
+3. `supabase/migrations/secure_availability.sql`
+4. `supabase/migrations/scheduled_availability.sql`
+5. `supabase/migrations/phase2_checkout_and_expiry.sql`
 
-To learn more about Next.js, take a look at the following resources:
+Seed or configure authenticated demo accounts and trainer availability. Do not use real customer information.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Local development
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+npm ci
+npm run dev
+```
 
-## Deploy on Vercel
+Run checks:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+npm test
+npx tsc --noEmit
+npm run lint
+npm run build
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Current limitations
+
+- Checkout is simulated only; no real payment provider or funds are involved.
+- Unpaid booking holds expire after 10 minutes when booking or availability APIs are used. For production, run expiry on a scheduled server-side job too.
+- Booking API returns HTTP 200 for an already-existing idempotency key and HTTP 201 for a new booking. Database unique constraint/RPC protect duplicate creation under concurrent requests.
+- Scheduled availability query is implemented by `get_available_trainers_for_slot`; database migration must be applied before using it.
+- Session lifecycle/timer, packages, fitness assessment UI, recommendations, trainer/admin workflows, deployment, and end-to-end tests remain incomplete.
+- Availability can change between lookup and booking. Booking RPC and database exclusion constraint are final conflict guards.

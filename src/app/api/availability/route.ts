@@ -6,6 +6,7 @@ import { createClient } from "@/lib/supabase/server";
 const querySchema = z.object({
   serviceZoneId: z.string().uuid(),
   startsAt: z.string().datetime({ offset: true }),
+  mode: z.enum(["INSTANT", "SCHEDULED"]).default("INSTANT"),
 });
 
 export async function GET(request: NextRequest) {
@@ -23,9 +24,16 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  const { error: expiryError } = await supabase.rpc("expire_pending_bookings");
+  if (expiryError) {
+    console.error("Pending booking expiry failed", { code: expiryError.code });
+    return NextResponse.json({ error: "Could not refresh booking availability." }, { status: 503 });
+  }
+
   const parsed = querySchema.safeParse({
     serviceZoneId: request.nextUrl.searchParams.get("serviceZoneId"),
     startsAt: request.nextUrl.searchParams.get("startsAt"),
+    mode: request.nextUrl.searchParams.get("mode") ?? "INSTANT",
   });
 
   if (!parsed.success) {
@@ -35,23 +43,24 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const { serviceZoneId, startsAt } = parsed.data;
+  const { serviceZoneId, startsAt, mode } = parsed.data;
   const startDate = new Date(startsAt);
 
-  if (
-    !Number.isFinite(startDate.getTime()) ||
-    startDate.getTime() <= Date.now() ||
-    startDate.getTime() > Date.now() + 60 * 60 * 1000
-  ) {
+  const now = Date.now();
+  const startMs = startDate.getTime();
+  const invalidInstant = mode === "INSTANT" && (startMs <= now || startMs > now + 60 * 60 * 1000);
+  const invalidScheduled = mode === "SCHEDULED" && startMs < now + 60 * 60 * 1000;
+  if (!Number.isFinite(startMs) || invalidInstant || invalidScheduled) {
     return NextResponse.json(
-      { error: "Instant bookings must start within the next 60 minutes." },
+      { error: mode === "INSTANT" ? "Instant bookings must start within the next 60 minutes." : "Scheduled bookings must start at least 60 minutes ahead." },
       { status: 400 },
     );
   }
 
-  const { data, error } = await supabase.rpc("get_available_trainers", {
+  const { data, error } = await supabase.rpc("get_available_trainers_for_slot", {
     p_service_zone_id: serviceZoneId,
     p_starts_at: startDate.toISOString(),
+    p_mode: mode,
   });
 
   if (error) {
@@ -88,5 +97,6 @@ export async function GET(request: NextRequest) {
     trainers: data ?? [],
     startsAt: startDate.toISOString(),
     durationMinutes: 60,
+    mode,
   });
 }

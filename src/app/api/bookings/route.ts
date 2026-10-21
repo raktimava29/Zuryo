@@ -64,6 +64,12 @@ export async function POST(request: Request) {
     );
   }
 
+  const { error: expiryError } = await supabase.rpc("expire_pending_bookings");
+  if (expiryError) {
+    console.error("Pending booking expiry failed", { code: expiryError.code });
+    return NextResponse.json({ error: "Could not refresh booking availability." }, { status: 503 });
+  }
+
   let body: unknown;
 
   try {
@@ -88,6 +94,19 @@ export async function POST(request: Request) {
   }
 
   const input = parsed.data;
+
+  // Preserve HTTP semantics for ordinary idempotent retries. The database RPC
+  // remains authoritative and protects concurrent duplicate requests.
+  const { data: priorBooking, error: priorLookupError } = await supabase
+    .from("bookings")
+    .select("id")
+    .eq("customer_id", user.id)
+    .eq("idempotency_key", input.idempotencyKey)
+    .maybeSingle();
+  if (priorLookupError) {
+    console.error("Booking idempotency lookup failed", { code: priorLookupError.code });
+    return NextResponse.json({ error: "Booking could not be created." }, { status: 500 });
+  }
 
   const { data, error } = await supabase.rpc("create_booking", {
     p_starts_at: input.startsAt,
@@ -133,6 +152,6 @@ export async function POST(request: Request) {
 
   return NextResponse.json(
     { booking: data },
-    { status: 201 },
+    { status: priorBooking ? 200 : 201 },
   );
 }

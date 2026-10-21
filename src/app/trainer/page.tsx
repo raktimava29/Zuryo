@@ -1,23 +1,14 @@
 import { requireRole } from "@/lib/auth/require-role";
 import { connection } from "next/server";
 import { Suspense } from "react";
+import TrainerDashboard from "./trainer-dashboard";
 
 async function TrainerContent() {
   await connection();
   const { profile } = await requireRole(["TRAINER"]);
-
-  return (
-    <main className="p-8">
-      <h1 className="text-3xl font-bold">Trainer workspace</h1>
-      <p className="mt-2">Welcome, {profile.full_name}</p>
-    </main>
-  );
+  return <TrainerDashboard trainerName={profile.full_name} />;
 }
 
 export default function TrainerPage() {
-  return (
-    <Suspense fallback={<p>Loading customer dashboard...</p>}>
-      <TrainerContent />
-    </Suspense>
-  );
+  return <Suspense fallback={<main className="p-8 text-slate-600">Loading trainer workspace…</main>}><TrainerContent /></Suspense>;
 }
