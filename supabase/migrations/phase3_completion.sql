@@ -47,7 +47,9 @@ create or replace function public.process_razorpay_webhook(
 ) returns jsonb language plpgsql security definer set search_path = '' as $$
 declare v_payment public.payments%rowtype; v_booking public.bookings%rowtype; v_catalog public.package_catalog%rowtype; v_customer_id uuid;
 begin
-  if coalesce(current_setting('request.jwt.claim.role', true), '') <> 'service_role' then raise exception 'SERVICE_ROLE_REQUIRED' using errcode='42501'; end if;
+  if coalesce(auth.role(), '') <> 'service_role' then
+  raise exception 'SERVICE_ROLE_REQUIRED' using errcode = '42501';
+end if;
   if p_event_id is null or p_event_type is null or p_order_id is null or p_payment_id is null then raise exception 'INVALID_WEBHOOK_EVENT'; end if;
   insert into public.payment_webhook_events(event_id,event_type) values(p_event_id,p_event_type) on conflict(event_id) do nothing;
   if not found then return jsonb_build_object('processed',false,'reason','DUPLICATE_EVENT'); end if;
