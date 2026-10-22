@@ -12,6 +12,7 @@ const nextConfig: NextConfig = {
       },
     },
   },
+  allowedDevOrigins: ['hardened-issue-copious.ngrok-free.dev'],
 };
 
 export default nextConfig;

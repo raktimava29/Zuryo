@@ -1,7 +1,3 @@
--- Phase 3 completion: package purchase webhook accounting and package-credit redemption.
--- Run AFTER phase3_payments_packages.sql.
-
--- Payments may represent either a booking payment or a package purchase.
 alter table public.payments alter column booking_id drop not null;
 alter table public.payments add column if not exists package_catalog_id uuid references public.package_catalog(id);
 alter table public.payments drop constraint if exists payments_booking_id_key;

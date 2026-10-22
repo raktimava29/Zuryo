@@ -1,6 +1,3 @@
--- Phase 3: Razorpay order persistence, verified webhook transitions, and package credit ledger.
--- Apply after session_lifecycle.sql and all Phase 2 migrations.
-
 alter table public.payments
   add column if not exists provider_order_id text unique,
   add column if not exists provider_payment_id text unique,
