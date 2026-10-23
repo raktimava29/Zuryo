@@ -12,7 +12,8 @@ type Booking = {
 type ApiError = { error?: string; message?: string };
 
 const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000').replace(/\/$/, '');
-const DEFAULT_CUSTOMER = '8e896e60-f388-48f7-be72-76e62df848ef';
+type SessionUser = { id: string; email: string; displayName: string; role: 'CUSTOMER' | 'TRAINER' | 'OPS' };
+
 const money = (value: number | string) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 }).format(Number(value));
 const dateLabel = (date: Date, options: Intl.DateTimeFormatOptions) => new Intl.DateTimeFormat('en-IN', options).format(date);
 const toLocalInput = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
@@ -22,7 +23,7 @@ const maxBookingDateTime = () => { const date = new Date(); date.setDate(date.ge
 const minBookingDateTime = () => { const date = new Date(); date.setSeconds(0, 0); date.setMinutes(Math.ceil(date.getMinutes() / 15) * 15); return toLocalDateTimeInput(date); };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, { ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) } });
+  const response = await fetch(`${API}${path}`, { credentials: 'include', ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) } });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = payload as ApiError;
@@ -31,8 +32,72 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
+type TrainerSession = {
+  id: string; customer_id: string; customer_name: string; trainer_id: string; status: string;
+  starts_at: string; ends_at: string; session_started_at: string | null; session_completed_at: string | null;
+  service_zone: string; total_amount: string;
+};
+
+function TrainerWorkspace({ user, onLogout }: { user: SessionUser; onLogout: () => Promise<void> }) {
+  const [sessions, setSessions] = useState<TrainerSession[]>([]);
+  const [serverNow, setServerNow] = useState(Date.now());
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState('');
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  const refresh = useCallback(async () => {
+    try {
+      const result = await request<{ sessions: TrainerSession[]; serverNow: string }>('/api/trainer/sessions');
+      setSessions(result.sessions);
+      setServerNow(new Date(result.serverNow).getTime());
+      setError('');
+    } catch (e) { setError(e instanceof Error ? e.message : 'Could not load assigned sessions'); }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const id = window.setInterval(() => { setServerNow(v => v + 15000); void refresh(); }, 15000);
+    return () => window.clearInterval(id);
+  }, [refresh]);
+
+  async function sessionAction(session: TrainerSession, action: 'start' | 'complete') {
+    setBusyId(session.id); setError(''); setNotice('');
+    try {
+      await request(`/api/trainer/sessions/${session.id}/${action}`, { method: 'POST', body: '{}' });
+      setNotice(action === 'start' ? 'Session started. Timer uses server-recorded start time.' : 'Session completed.');
+      await refresh();
+    } catch (e) { setError(e instanceof Error ? e.message : 'Session update failed'); await refresh(); }
+    finally { setBusyId(''); }
+  }
+
+  const active = sessions.filter(s => s.status === 'IN_PROGRESS');
+  const upcoming = sessions.filter(s => s.status === 'CONFIRMED');
+  const history = sessions.filter(s => ['COMPLETED', 'CANCELLED', 'NO_TRAINER'].includes(s.status));
+  const fmt = (value: string) => dateLabel(new Date(value), { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+  const remaining = (session: TrainerSession) => Math.max(0, 3600 - Math.floor((serverNow - new Date(session.session_started_at!).getTime()) / 1000));
+  const timer = (seconds: number) => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+
+  return <div className="app-shell"><aside className="sidebar"><div className="brand-lockup"><span className="brand-mark">z</span><span className="brand-name">zuryo<span>FITNESS, TOGETHER</span></span></div><div className="sidebar-label">TRAINER WORKSPACE</div><div className="sidebar-bottom"><div className="avatar">{user.displayName.split(' ').map(x => x[0]).slice(0,2).join('').toUpperCase()}</div><div className="profile-label"><strong>{user.displayName}</strong><span>Trainer account</span></div><span className="online-dot" /></div></aside>
+    <main className="main-content"><header className="topbar"><div><span className="eyebrow">COACH CONSOLE</span><h1>Your sessions.</h1></div><div className="topbar-right"><span className="status-pill"><span/> Live refresh · 15 sec</span><button className="logout-button" onClick={() => void onLogout()}>Log out</button></div></header>
+    {error && <div className="notice error" role="alert"><span>!</span><p>{error}</p><button onClick={() => setError('')}>×</button></div>}{notice && <div className="notice success" role="status"><span>✓</span><p>{notice}</p><button onClick={() => setNotice('')}>×</button></div>}
+    <div className="section-heading"><div><span className="eyebrow">YOUR COACHING DAY</span><h2>Assigned sessions</h2></div><button className="outline-button" onClick={() => void refresh()}>↻ Refresh</button></div>
+    <div className="history-stats"><div className="stat-card"><span>IN PROGRESS</span><strong>{active.length}</strong><small>Active sessions</small></div><div className="stat-card"><span>UPCOMING</span><strong>{upcoming.length}</strong><small>Assigned sessions</small></div><div className="stat-card"><span>COMPLETED</span><strong>{history.length}</strong><small>Session history</small></div></div>
+    {loading ? <div className="loading-state"><span className="spinner"/> Loading sessions…</div> : sessions.length === 0 ? <div className="empty-history"><div className="empty-icon">▤</div><h3>No assigned sessions yet</h3><p>New customer bookings will appear here automatically.</p></div> : <div className="booking-list">{sessions.map(session => { const seconds = session.session_started_at ? remaining(session) : 3600; const canStart = session.status === 'CONFIRMED' && new Date(session.starts_at).getTime() <= serverNow + 15 * 60 * 1000 && new Date(session.ends_at).getTime() > serverNow; return <article className="booking-row trainer-session-row" key={session.id}><div className="booking-date"><strong>{dateLabel(new Date(session.starts_at), { day: '2-digit' })}</strong><span>{dateLabel(new Date(session.starts_at), { month: 'short' }).toUpperCase()}</span></div><div className="booking-detail"><strong>{session.customer_name}</strong><span>{fmt(session.starts_at)} – {dateLabel(new Date(session.ends_at), { hour: 'numeric', minute: '2-digit' })}</span><small>{session.service_zone} · {session.id.slice(0, 8)}</small>{session.status === 'IN_PROGRESS' && <div className="session-timer"><strong>{timer(seconds)}</strong><span>{seconds <= 300 ? '55-minute warning reached' : 'Session in progress'}</span><div className="timer-track"><span style={{ width: `${Math.min(100, ((3600 - seconds) / 3600) * 100)}%` }}/></div></div>}</div><div className="booking-amount"><span className={`booking-status ${session.status.toLowerCase()}`}>{session.status.replace('_', ' ')}</span>{session.status === 'IN_PROGRESS' && <small>{seconds === 0 ? 'Finishing…' : `${Math.ceil(seconds / 60)} min left`}</small>}</div><div className="booking-actions">{canStart ? <button className="primary-button trainer-action" disabled={busyId === session.id} onClick={() => void sessionAction(session, 'start')}>{busyId === session.id ? 'Starting…' : 'Start session'}</button> : session.status === 'IN_PROGRESS' ? <button className="primary-button trainer-action" disabled={busyId === session.id || seconds > 0} onClick={() => void sessionAction(session, 'complete')}>{busyId === session.id ? 'Completing…' : seconds > 0 ? 'In progress' : 'Complete session'}</button> : <span className="muted-dash">—</span>}</div></article>})}</div>}
+    <footer className="footer"><span>© 2026 ZURYO FITNESS</span><span>MOVE WELL. FEEL MORE.</span><span>SERVER-TIMED SESSIONS</span></footer></main></div>;
+}
+
 function App() {
-  const [customerId, setCustomerId] = useState(DEFAULT_CUSTOMER);
+  const [authUser, setAuthUser] = useState<SessionUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
+  const [authName, setAuthName] = useState('');
+  const [authEmail, setAuthEmail] = useState('customer.demo@zuryo.local');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => toLocalInput(new Date(Date.now() + 24 * 60 * 60 * 1000)));
   const [hour, setHour] = useState(() => { const initial = new Date(Date.now() + 24 * 60 * 60 * 1000); initial.setHours(10, 0, 0, 0); return initial.toISOString(); });
   const [zone, setZone] = useState('ZONE-A');
@@ -82,8 +147,23 @@ function App() {
     } finally { setLoadingBookings(false); }
   }, [customerId]);
 
-  useEffect(() => { void loadAvailability(); }, [loadAvailability]);
-  useEffect(() => { void loadBookings(); }, [loadBookings]);
+  useEffect(() => { request<{ user: SessionUser }>('/api/auth/me').then(({ user }) => { setAuthUser(user); setCustomerId(user.id); }).catch(() => undefined).finally(() => setAuthChecked(true)); }, []);
+  useEffect(() => { if (authUser?.role === 'CUSTOMER') void loadAvailability(); }, [authUser, loadAvailability]);
+  useEffect(() => { if (authUser?.role !== 'CUSTOMER') return; void loadBookings(); const id = window.setInterval(() => { void loadBookings(); }, 15000); return () => window.clearInterval(id); }, [authUser, loadBookings]);
+
+  async function submitAuth(event: React.FormEvent) {
+    event.preventDefault(); setAuthBusy(true); setAuthError('');
+    try {
+      const payload = authMode === 'signup'
+        ? { displayName: authName, email: authEmail, password: authPassword }
+        : { email: authEmail, password: authPassword };
+      const result = await request<{ user: SessionUser }>(`/api/auth/${authMode}`, { method: 'POST', body: JSON.stringify(payload) });
+      setAuthUser(result.user); setCustomerId(result.user.id);
+    } catch (error) { setAuthError(error instanceof Error ? error.message : 'Authentication failed'); }
+    finally { setAuthBusy(false); }
+  }
+  async function logout() { await request('/api/auth/logout', { method: 'POST' }).catch(() => undefined); setAuthUser(null); setCustomerId(''); setBookings([]); setTrainers([]); setAuthPassword(''); }
+
 
   async function createBooking() {
     if (!isFuture) { setNotice({ type: 'error', text: 'Choose a future time slot.' }); return; }
@@ -125,17 +205,22 @@ function App() {
   const activeBookings = bookings.filter(b => ['CONFIRMED', 'IN_PROGRESS'].includes(b.status));
   const completedBookings = bookings.filter(b => ['COMPLETED', 'CANCELLED'].includes(b.status));
 
+  if (!authChecked) return <div className="auth-screen"><div className="auth-card"><span className="brand-mark">z</span><h1>Loading Zuryo…</h1></div></div>;
+  if (!authUser) return <div className="auth-screen"><form className="auth-card" onSubmit={submitAuth}><span className="brand-mark">z</span><span className="eyebrow">YOUR COMMUNITY. YOUR COACH.</span><h1>{authMode === 'login' ? 'Welcome back.' : 'Start moving.'}</h1><p>{authMode === 'login' ? 'Log in to manage your fitness sessions.' : 'Create your customer account.'}</p>{authMode === 'signup' && <label>Full name<input required minLength={2} value={authName} onChange={e => setAuthName(e.target.value)} placeholder="Your name" /></label>}<label>Email<input required type="email" value={authEmail} onChange={e => setAuthEmail(e.target.value)} placeholder="you@example.com" /></label><label>Password<input required type="password" minLength={authMode === 'signup' ? 10 : 1} value={authPassword} onChange={e => setAuthPassword(e.target.value)} placeholder={authMode === 'signup' ? 'At least 10 characters' : 'Your password'} /></label>{authError && <p className="auth-error">{authError}</p>}<button className="primary-button" disabled={authBusy}>{authBusy ? 'Please wait…' : authMode === 'login' ? 'Log in' : 'Create account'} <span>↗</span></button><button type="button" className="auth-switch" onClick={() => { setAuthMode(authMode === 'login' ? 'signup' : 'login'); setAuthError(''); }}>{authMode === 'login' ? 'New to Zuryo? Create account' : 'Already registered? Log in'}</button><div className="demo-login"><strong>Demo access</strong><span>Customer: customer.demo@zuryo.local</span><span>Trainer: trainer.demo@zuryo.local</span><span>Operations: ops.demo@zuryo.local</span><small>Demo passwords listed in README. Change before public deployment.</small></div></form></div>;
+  if (authUser.role === 'TRAINER') return <TrainerWorkspace user={authUser} onLogout={logout} />;
+  if (authUser.role === 'OPS') return <div className="auth-screen"><div className="auth-card role-card"><span className="brand-mark">z</span><span className="eyebrow">OPERATIONS WORKSPACE</span><h1>Welcome, {authUser.displayName}.</h1><p>Operations dashboard remains next phase. Trainer sessions are now live.</p><button className="primary-button" onClick={() => void logout()}>Log out <span>↗</span></button></div></div>;
+
   return <div className="app-shell">
     <aside className="sidebar">
       <a className="brand" href="#top" aria-label="Zuryo home"><span className="brand-mark">z</span><span>zuryo<span className="brand-dot">.</span></span></a>
       <div className="side-label">YOUR SPACE</div>
       <button className={`nav-link ${tab === 'book' ? 'active' : ''}`} onClick={() => setTab('book')}><span className="nav-icon">＋</span> Book a session</button>
       <button className={`nav-link ${tab === 'history' ? 'active' : ''}`} onClick={() => setTab('history')}><span className="nav-icon">▤</span> My bookings <span className="nav-count">{activeBookings.length}</span></button>
-      <div className="sidebar-bottom"><div className="avatar">DC</div><div className="profile-label"><strong>Demo Customer</strong><span>Customer account</span></div><span className="online-dot" /></div>
+      <div className="sidebar-bottom"><div className="avatar">DC</div><div className="profile-label"><strong>{authUser.displayName}</strong><span>Customer account</span></div><span className="online-dot" /></div>
     </aside>
 
     <main className="main-content" id="top">
-      <header className="topbar"><div><span className="eyebrow">YOUR COMMUNITY. YOUR COACH.</span><h1>{tab === 'book' ? 'Make time for you.' : 'Your sessions.'}</h1></div><div className="topbar-right"><span className="status-pill"><span /> Demo environment</span><button className="avatar avatar-small" title="Demo customer">DC</button></div></header>
+      <header className="topbar"><div><span className="eyebrow">YOUR COMMUNITY. YOUR COACH.</span><h1>{tab === 'book' ? 'Make time for you.' : 'Your sessions.'}</h1></div><div className="topbar-right"><span className="status-pill"><span /> Demo environment</span><button className="logout-button" onClick={() => void logout()}>Log out</button></div></header>
       {notice && <div className={`notice ${notice.type}`} role="status"><span>{notice.type === 'success' ? '✓' : notice.type === 'error' ? '!' : 'i'}</span><p>{notice.text}</p><button onClick={() => setNotice(null)} aria-label="Dismiss message">×</button></div>}
 
       {tab === 'book' ? <>
