@@ -39,10 +39,11 @@ Apply migrations in order in Supabase SQL Editor:
 2. `supabase/migrations/booking_engine.sql`
 3. `supabase/migrations/secure_availability.sql`
 4. `supabase/migrations/scheduled_availability.sql`
-5. `supabase/migrations/phase2_checkout_and_expiry.sql`
+5. `supabase/migrations/checkout_and_expiry.sql`
 6. `supabase/migrations/session_lifecycle.sql`
-7. `supabase/migrations/phase3_payments_packages.sql`
+7. `supabase/migrations/payments_packages.sql`
 8. `supabase/migrations/phase3_completion.sql`
+9. `supabase/migrations/phase3_finalization.sql`
 
 Seed or configure authenticated demo accounts and trainer availability. Do not use real customer information.
 
@@ -65,11 +66,18 @@ npm run build
 ## Current limitations
 
 - Customer checkout now uses Razorpay Checkout; verified webhooks are authoritative for payment state. Keep `/api/checkout` for local/demo-only testing and do not expose it as a production payment option.
-- Package purchase and redemption endpoints require both Phase 3 migrations. Package credits are added only after verified captured-payment webhook. Configure a webhook URL pointing to `/api/payments/razorpay/webhook` with `payment.captured` and `payment.failed` events.
-- Package-credit restoration RPC is admin-only and intended for an authorized cancellation/refund workflow; cash refunds must still be initiated and confirmed through Razorpay before marking a payment refunded.
+- Package purchase and redemption endpoints require all Phase 3 migrations. Package credits are added only after verified captured-payment webhook. Configure a webhook URL pointing to `/api/payments/razorpay/webhook` with `payment.captured`, `payment.failed`, and `refund.processed` events.
+- Package-credit restoration RPC is admin-only; restores one consumed credit only after its booking is `CANCELLED`, only once, and only while package remains unexpired.
+- Full refunds are reconciled only after Razorpay sends a signature-verified `refund.processed` webhook. Configure this event alongside `payment.captured` and `payment.failed`. Refund rows are idempotent by provider refund ID and webhook event ID.
+- Phase 3 supports full-refund reconciliation. Partial refunds are recorded, but payment remains `SUCCEEDED` until cumulative processed refunds equal original payment amount. Do not initiate partial refunds in the MVP.
+- A full package refund revokes remaining package credits and writes a `REFUND` ledger entry. Previously consumed credits are not restored. A booking payment refund should follow booking cancellation; webhook reports `booking_reconciliation_required` if provider refund arrives while booking is not cancelled.
 - Package catalog is not seeded automatically; insert reviewed package rows into `public.package_catalog` before selling packages.
 - Unpaid booking holds expire after 10 minutes when booking or availability APIs are used. For production, run expiry on a scheduled server-side job too.
 - Booking API returns HTTP 200 for an already-existing idempotency key and HTTP 201 for a new booking. Database unique constraint/RPC protect duplicate creation under concurrent requests.
 - Scheduled availability query is implemented by `get_available_trainers_for_slot`; database migration must be applied before using it.
 - Fitness assessment UI, recommendations, trainer/admin workflows, deployment, and end-to-end tests remain incomplete.
 - Availability can change between lookup and booking. Booking RPC and database exclusion constraint are final conflict guards.
+
+See [`PHASE3_RELEASE_CHECKLIST.md`](./PHASE3_RELEASE_CHECKLIST.md) for deployment steps, refund policy, sandbox acceptance checks, and verification SQL.
+
+See [`PHASE3_RELEASE_CHECKLIST.md`](./PHASE3_RELEASE_CHECKLIST.md) for deployment steps, refund policy, sandbox acceptance checks, and verification SQL.

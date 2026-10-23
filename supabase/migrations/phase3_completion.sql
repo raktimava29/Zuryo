@@ -48,8 +48,8 @@ create or replace function public.process_razorpay_webhook(
 declare v_payment public.payments%rowtype; v_booking public.bookings%rowtype; v_catalog public.package_catalog%rowtype; v_customer_id uuid;
 begin
   if coalesce(auth.role(), '') <> 'service_role' then
-  raise exception 'SERVICE_ROLE_REQUIRED' using errcode = '42501';
-end if;
+    raise exception 'SERVICE_ROLE_REQUIRED' using errcode = '42501';
+  end if;
   if p_event_id is null or p_event_type is null or p_order_id is null or p_payment_id is null then raise exception 'INVALID_WEBHOOK_EVENT'; end if;
   insert into public.payment_webhook_events(event_id,event_type) values(p_event_id,p_event_type) on conflict(event_id) do nothing;
   if not found then return jsonb_build_object('processed',false,'reason','DUPLICATE_EVENT'); end if;
@@ -146,14 +146,15 @@ end; $$;
 revoke all on function public.redeem_package_for_booking(uuid,uuid) from public,anon;
 grant execute on function public.redeem_package_for_booking(uuid,uuid) to authenticated;
 
--- Refund credits for eligible cancelled package bookings; called by future cancellation/refund flow.
+-- Restore one package credit only after an actually consumed credit's booking is cancelled.
 create or replace function public.restore_package_credit(p_booking_id uuid,p_reason text default 'Booking cancelled')
 returns boolean language plpgsql security definer set search_path = '' as $$
 declare v_booking public.bookings%rowtype;
 begin
   if auth.uid() is null or not exists(select 1 from public.profiles where id=auth.uid() and role='ADMIN') then raise exception 'ADMIN_REQUIRED' using errcode='42501'; end if;
   select * into v_booking from public.bookings where id=p_booking_id for update;
-  if not found or v_booking.payment_method<>'PACKAGE' or v_booking.package_id is null then return false; end if;
+  if not found or v_booking.status <> 'CANCELLED' or v_booking.payment_method <> 'PACKAGE' or v_booking.package_id is null then return false; end if;
+  if not exists(select 1 from public.package_ledger where booking_id=p_booking_id and entry_type='USE') then return false; end if;
   if exists(select 1 from public.package_ledger where booking_id=p_booking_id and entry_type='RESTORE') then return false; end if;
   update public.packages set sessions_remaining=sessions_remaining+1 where id=v_booking.package_id and (expires_at is null or expires_at>clock_timestamp());
   if not found then return false; end if;
